@@ -1,0 +1,34 @@
+*.bak
+data
+results
+build
+bin
+start_container.sh
+*.sif
+*.tar
+job_*.sh
+log.txt
+
+# compiled objects and libraries (CMake builds KMC/kmc_api from source)
+*.o
+*.a
+*.so
+
+# editor settings
+.vscode/
+
+# LaTeX build products
+*.aux
+*.bbl
+*.blg
+*.fdb_latexmk
+*.fls
+*.log
+*.out
+*.toc
+*.synctex.gz
+
+# scripts/run_tests.sh work folder, gpu-ibs example output, side builds
+test_work/
+gpu-ibs-example/
+build-*/

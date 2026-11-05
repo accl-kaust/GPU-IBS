@@ -1,0 +1,26 @@
+# Text files are stored with LF and checked out with LF everywhere, so a
+# clone on Windows (core.autocrlf=true) still runs its shell scripts under
+# bash, WSL and the cluster.
+* text=auto eol=lf
+
+*.sh       text eol=lf
+*.sbatch   text eol=lf
+*.def      text eol=lf
+Dockerfile text eol=lf
+*.cpp      text eol=lf
+*.hpp      text eol=lf
+*.h        text eol=lf
+*.cu       text eol=lf
+*.cuh      text eol=lf
+*.py       text eol=lf
+*.js       text eol=lf
+*.md       text eol=lf
+*.tex      text eol=lf
+*.bib      text eol=lf
+
+*.pdf  binary
+*.png  binary
+*.jpg  binary
+*.docx binary
+*.pptx binary
+*.gz   binary

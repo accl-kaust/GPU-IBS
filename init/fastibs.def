@@ -1,0 +1,42 @@
+# Apptainer / Singularity definition for building fastibs.sif WITHOUT Docker
+# (install.sh uses it when docker is missing or its daemon is not usable). The image carries the
+# CUDA 12.4 toolchain, so the binaries are compiled inside it and land in
+# ./bin on the host, exactly as in the Docker flow:
+#
+#   apptainer build --fakeroot fastibs.sif init/fastibs.def
+#   apptainer exec --cleanenv --bind .:/project fastibs.sif bash -c "cd /project && bash compile.sh"
+#   apptainer exec --nv --bind .:/project fastibs.sif /project/bin/fastibs --help
+#
+# For a CPU-only image change "From:" to ubuntu:22.04 (install.sh does this
+# itself from BUILDER_BASE in init/config.sh, e.g. for FASTIBS_CUDA=off).
+# singularity works the same way; --nv is only needed to reach a GPU.
+Bootstrap: docker
+From: nvidia/cuda:12.4.1-devel-ubuntu22.04
+
+%post
+    export DEBIAN_FRONTEND=noninteractive
+    # Unprivileged --fakeroot builds (no subuid mapping, e.g. Singularity
+    # 3.9 on KAUST Ibex): /tmp can come up without its sticky world-writable
+    # mode and apt's _apt sandbox user cannot write there ("Couldn't create
+    # temporary file /tmp/apt.conf.XXXX for passing config to apt-key", then
+    # every repository "is not signed"). Restore /tmp and let apt stay root.
+    chmod 1777 /tmp
+    echo 'APT::Sandbox::User "root";' > /etc/apt/apt.conf.d/99-gpuibs-sandbox
+    apt-get update
+    apt-get install -y --no-install-recommends \
+        build-essential g++ cmake ninja-build \
+        zlib1g-dev libboost-dev git ca-certificates
+    apt-get clean
+    rm -rf /var/lib/apt/lists/*
+    mkdir -p /project/data
+
+%environment
+    export LC_ALL=C
+
+%labels
+    Name GPU-IBS
+    Description FastIBS tools (fastibs, fastibsmapper, KDBIntersect) with the GPU acceleration path
+
+%help
+    Bind the project directory at /project and run /project/bin/<tool>; add --nv
+    to reach the host's GPUs (the tools fall back to the CPU path without one).

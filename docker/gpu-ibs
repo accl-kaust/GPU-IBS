@@ -1,0 +1,240 @@
+#!/bin/bash
+# gpu-ibs: the helper command of the GPU-IBS container image.
+#
+#   gpu-ibs                 what is in the image and how to run it
+#   gpu-ibs info            versions, build, CPUs and the GPUs the container sees
+#   gpu-ibs selftest        make a small synthetic data set, run the three tools
+#                           on it, check GPU == CPU == original FastIBS code and
+#                           the recorded reference results
+#   gpu-ibs example [dir]   the same data laid out like a real project
+#                           (kmc_sets/, reference/, FastIBS_runs/) with every
+#                           command printed before it runs
+#   gpu-ibs fit <kmc_db>    the GPU memory a database needs and whether it fits
+#                           (scripts/realdata/03_preflight.sh)
+#   gpu-ibs <tool> ...      runs the tool (fastibs, fastibsmapper, KDBIntersect,
+#                           kmc, kmc_tools, kmc_dump), same as calling it directly
+set -uo pipefail
+
+SHARE=${GPU_IBS_SHARE:-/usr/local/share/gpu-ibs}
+SCRIPTS=$SHARE/scripts
+IMAGE=${GPU_IBS_IMAGE:-ahmadshakleya/gpu-ibs:latest}
+
+build_info () { sed -n "s/^$1=//p" "$SHARE/build-info" 2> /dev/null; }
+VERSION=$(build_info version); VERSION=${VERSION:-dev}
+
+# Reference results of the synthetic data set (make_test_panel.sh <dir> 3 25:
+# reference and database 1 = make_test_corpus.sh seed 1, databases 2 and 3 =
+# seeds 3 and 4). Every correct build gives these bytes, on the GPU or the CPU.
+REF_FASTA_SHA=fd15402f92412fecf69fa77c5c3eb15563b46ec940c4f5202352b8b05deb992d
+REF_SCAN_SHA=a11f7a236186bcdce56a9e037b1add73d6dcf7531c5ede6027373df04acfb5e9
+REF_MAP_SHA=c8e47bf6418daf79dde0ff6b841e6c8d0e1dce760eb486fc62f995654ada80cf
+REF_ISECT=1506574
+
+usage () {
+    cat << EOF
+GPU-IBS ${VERSION}: identity-by-state (IBS) scans of KMC k-mer databases
+against reference genomes, on NVIDIA GPUs when the container can see one
+and on the CPU otherwise (same output, byte for byte).
+
+Tools (on PATH; each prints its full usage with --help):
+  fastibs        IBS distance per window
+                   fastibs <kmc_db_dir> <reference_dir> <results_dir> <window_size> [options]
+  fastibsmapper  per-base k-mer coverage of the reference
+                   fastibsmapper <kmc_db_dir> <reference_dir> <results_dir> [options]
+  KDBIntersect   number of k-mers two databases share
+                   KDBIntersect <kmc_db_dir_1> <kmc_db_dir_2>
+  kmc, kmc_tools, kmc_dump   KMC $(build_info kmc), to count k-mers from reads
+
+Helper commands:
+  gpu-ibs info             versions, CPUs, GPUs visible in the container
+  gpu-ibs selftest         check this image on this machine (under a minute)
+  gpu-ibs example [dir]    a worked example in <dir> (default ./gpu-ibs-example)
+  gpu-ibs fit <kmc_db>     GPU memory the database needs, and whether it fits
+                           the visible GPU (or 40/80 GB A100s); SHARDS=N for N GPUs
+
+Run it (the current directory is mounted at /data, the working directory):
+  docker run --rm --gpus all -u \$(id -u):\$(id -g) -v "\$PWD":/data ${IMAGE} \\
+      fastibs kmc_sets/SAMPLE reference FastIBS_runs 50000
+  apptainer exec --nv gpu-ibs.sif fastibs kmc_sets/SAMPLE reference FastIBS_runs 50000
+
+Without --gpus all (Docker) or --nv (Apptainer/Singularity) the tools run on
+the CPU. Documentation: https://github.com/accl-kaust/GPU-IBS
+EOF
+}
+
+gpu_lines () {
+    if command -v nvidia-smi > /dev/null 2>&1 && nvidia-smi -L > /dev/null 2>&1; then
+        nvidia-smi --query-gpu=index,name,memory.total,driver_version --format=csv,noheader \
+            | sed 's/^/  GPU /'
+    else
+        echo "  none visible (Docker: run with --gpus all; Apptainer/Singularity: run with --nv)"
+    fi
+}
+
+cmd_info () {
+    local cuda; cuda=$(build_info cuda)
+    echo "GPU-IBS     ${VERSION} (revision $(build_info revision))"
+    echo "tools       $(fastibs --version 2>/dev/null)"
+    if [ "$cuda" = ON ]; then
+        echo "build       GPU + CPU (CUDA $(build_info cuda_version), architectures $(build_info cuda_archs); driver >= 525.60 needed)"
+    else
+        echo "build       CPU only"
+    fi
+    echo "KMC         $(kmc 2>&1 | sed -n 's/.*ver\. \([^ ]*\).*/\1/p' | head -1)"
+    echo "CPUs        $(nproc) usable ($(grep -c ^processor /proc/cpuinfo) on the machine)"
+    echo "memory      $(awk '/MemTotal/ {printf "%.1f GB", $2/1048576}' /proc/meminfo)"
+    echo "GPUs"
+    gpu_lines
+}
+
+# path_of <log>: which path a tool run took, from its [gpu] lines
+path_of () {
+    if grep -q 'no CUDA device found\|falling back to CPU' "$1"; then echo cpu
+    elif grep -q '^\[gpu\]' "$1"; then echo gpu
+    else echo cpu; fi
+}
+
+make_data () {
+    # $1 = folder; reference + three databases, as make_test_panel.sh lays them out
+    if [ -f "$1/db3/sample.kmc_suf" ]; then return 0; fi
+    echo "making the synthetic data set (2.2 Mbp reference, three samples, k=25) ..."
+    KMC_THREADS=${KMC_THREADS:-4} bash "$SCRIPTS/make_test_panel.sh" "$1" 3 25 > "$1.log" 2>&1 \
+        || { echo "error: data generation failed; see $1.log" >&2; tail -5 "$1.log" >&2; return 1; }
+}
+
+cmd_selftest () {
+    local keep="" require_gpu=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --keep) keep=${2:?--keep needs a folder}; shift 2 ;;
+            --keep=*) keep=${1#--keep=}; shift ;;
+            --require-gpu) require_gpu=1; shift ;;
+            -h|--help) echo "usage: gpu-ibs selftest [--keep <dir>] [--require-gpu]"; return 0 ;;
+            *) echo "unknown option: $1 (usage: gpu-ibs selftest [--keep <dir>] [--require-gpu])" >&2; return 2 ;;
+        esac
+    done
+    local W
+    if [ -n "$keep" ]; then W=$(readlink -m "$keep"); mkdir -p "$W" || return 1
+    else W=$(mktemp -d "${TMPDIR:-/tmp}/gpu-ibs-selftest.XXXXXX") || return 1; fi
+    local D=$W/data O=$W/out; rm -rf "$O"; mkdir -p "$O"
+    local failed=0
+    ok ()  { echo "  ok    $*"; }
+    bad () { echo "  FAIL  $*"; failed=$((failed+1)); }
+    same_sha () { [ "$(cat "$1"/* 2> /dev/null | sha256sum | cut -d' ' -f1)" = "$2" ]; }
+
+    echo "GPU-IBS ${VERSION} selftest (work folder $W)"
+    gpu_lines
+    make_data "$D" || return 1
+    local fasta_sha; fasta_sha=$(sha256sum "$D/refs/test_genome.fasta" | cut -d' ' -f1)
+    [ "$fasta_sha" = "$REF_FASTA_SHA" ] && ok "synthetic reference identical to the recorded one" \
+        || bad "synthetic reference differs from the recorded one (sha256 $fasta_sha)"
+
+    # fastibs: default path (GPU when visible), forced CPU, original FastIBS code
+    mkdir -p "$O/scan" "$O/scan_cpu" "$O/scan_orig"
+    fastibs "$D/db1" "$D/refs" "$O/scan" 50000 > "$O/scan.log" 2>&1 || bad "fastibs exited with status $? (see $O/scan.log)"
+    local path; path=$(path_of "$O/scan.log")
+    fastibs "$D/db1" "$D/refs" "$O/scan_cpu" 50000 --cpu > "$O/scan_cpu.log" 2>&1 || bad "fastibs --cpu exited with status $?"
+    FASTIBS_LEGACY=1 fastibs "$D/db1" "$D/refs" "$O/scan_orig" 50000 --cpu > "$O/scan_orig.log" 2>&1 || bad "fastibs (original code) exited with status $?"
+    same_sha "$O/scan" "$REF_SCAN_SHA" && ok "fastibs on the ${path^^}: IBS table matches the reference result" \
+        || bad "fastibs on the ${path^^}: IBS table differs from the reference result"
+    if [ "$path" = gpu ]; then
+        diff -r "$O/scan" "$O/scan_cpu" > /dev/null && ok "fastibs: GPU output == CPU output" || bad "fastibs: GPU output differs from the CPU output"
+    fi
+    diff -r "$O/scan_cpu" "$O/scan_orig" > /dev/null && ok "fastibs: CPU output == original FastIBS code" || bad "fastibs: CPU output differs from the original FastIBS code"
+
+    # fastibsmapper
+    mkdir -p "$O/map" "$O/map_cpu"
+    fastibsmapper "$D/db1" "$D/refs" "$O/map" > "$O/map.log" 2>&1 || bad "fastibsmapper exited with status $?"
+    fastibsmapper "$D/db1" "$D/refs" "$O/map_cpu" --cpu > "$O/map_cpu.log" 2>&1 || bad "fastibsmapper --cpu exited with status $?"
+    local mpath; mpath=$(path_of "$O/map.log")
+    same_sha "$O/map" "$REF_MAP_SHA" && ok "fastibsmapper on the ${mpath^^}: coverage matches the reference result" \
+        || bad "fastibsmapper on the ${mpath^^}: coverage differs from the reference result"
+    diff -r "$O/map" "$O/map_cpu" > /dev/null && ok "fastibsmapper: default path == CPU path" || bad "fastibsmapper: default path differs from the CPU path"
+
+    # KDBIntersect
+    local n n_cpu n_orig
+    n=$(KDBIntersect "$D/db1" "$D/db2" 2> "$O/isect.log")
+    n_cpu=$(FASTIBS_GPU=0 KDBIntersect "$D/db1" "$D/db2" 2> "$O/isect_cpu.log")
+    n_orig=$(FASTIBS_GPU=0 FASTIBS_LEGACY=1 KDBIntersect "$D/db1" "$D/db2" 2> "$O/isect_orig.log")
+    local ipath; ipath=$(path_of "$O/isect.log")
+    [ "$n" = "$REF_ISECT" ] && ok "KDBIntersect on the ${ipath^^}: $n shared k-mers, as recorded" \
+        || bad "KDBIntersect on the ${ipath^^}: '$n' shared k-mers, recorded $REF_ISECT"
+    [ "$n" = "$n_cpu" ] && [ "$n" = "$n_orig" ] && ok "KDBIntersect: default == CPU == original ($n_cpu, $n_orig)" \
+        || bad "KDBIntersect: default $n, CPU $n_cpu, original $n_orig"
+
+    if [ "$require_gpu" = 1 ] && [ "$path" != gpu ]; then
+        bad "--require-gpu: the tools ran on the CPU ($(grep -m1 -h '^\[gpu\]' "$O/scan.log" || echo 'CPU-only build'))"
+    fi
+
+    echo
+    if [ "$failed" = 0 ]; then
+        if [ "$path" = gpu ]; then echo "SELFTEST PASSED: the GPU path works and agrees with the CPU path"
+        else echo "SELFTEST PASSED on the CPU ($(grep -m1 -h '^\[gpu\]' "$O/scan.log" | sed 's/^\[gpu\] //' || true))"
+             echo "  (to use a GPU: docker run --gpus all ..., or apptainer/singularity exec --nv ...)"; fi
+        [ -z "$keep" ] && rm -rf "$W"
+        return 0
+    fi
+    echo "SELFTEST FAILED: $failed check(s); logs in $O"
+    return 1
+}
+
+cmd_example () {
+    local E; E=$(readlink -m "${1:-gpu-ibs-example}")
+    mkdir -p "$E" 2> /dev/null && [ -w "$E" ] || {
+        echo "error: cannot write to $E. Mount a folder you own and run as yourself, e.g." >&2
+        echo "  docker run --rm -u \$(id -u):\$(id -g) -v \"\$PWD\":/data ${IMAGE} gpu-ibs example" >&2
+        return 1; }
+    local T="$E/.gen"
+    make_data "$T" || return 1
+    mkdir -p "$E/reference" "$E/kmc_sets" "$E/FastIBS_runs"
+    # FastIBS names its tables after the reference file up to "_genome":
+    # example_genome.fasta -> <sample>_v_example_<W>.tsv
+    cp "$T/refs/test_genome.fasta" "$E/reference/example_genome.fasta"
+    local i
+    for i in 1 2 3; do
+        mkdir -p "$E/kmc_sets/sample$i"
+        cp "$T/db$i/sample.kmc_pre" "$E/kmc_sets/sample$i/sample$i.kmc_pre"
+        cp "$T/db$i/sample.kmc_suf" "$E/kmc_sets/sample$i/sample$i.kmc_suf"
+    done
+    rm -rf "$T" "$T.log"
+    cd "$E" || return 1
+    # run <log> <command...>: print the command, run it with its messages in <log>
+    run () {
+        local log=$1; shift
+        echo; echo "\$ $*"
+        "$@" > "$log" 2>&1 || { echo "  failed with status $?; see $E/$log"; return 1; }
+        echo "  ($(path_of "$log" | tr a-z A-Z) path; messages in $log)"
+    }
+    echo "Example project in $E:"
+    echo "  reference/      the reference genome(s), FASTA or FASTA.gz"
+    echo "  kmc_sets/       one folder per sample with its KMC database (k=25)"
+    echo "  FastIBS_runs/   results"
+    rm -f FastIBS_runs/*
+    run FastIBS_runs/fastibs_sample1.log fastibs kmc_sets/sample1 reference FastIBS_runs 50000 || return 1
+    echo "  -> FastIBS_runs/sample1_v_example_50000.tsv, one row per 50 kb window:"
+    head -4 FastIBS_runs/sample1_v_example_50000.tsv | sed 's/^/     /'
+    run FastIBS_runs/fastibs_panel.log fastibs kmc_sets/sample2 reference FastIBS_runs 50000 --db=kmc_sets/sample3 || return 1
+    echo "  -> two samples in one reference pass (panel mode):"
+    ls FastIBS_runs/sample2_*.tsv FastIBS_runs/sample3_*.tsv | sed 's/^/     /'
+    run FastIBS_runs/mapper_sample1.log fastibsmapper kmc_sets/sample1 reference FastIBS_runs || return 1
+    echo "  -> FastIBS_runs/sample1_v_example_genome.txt: per-base k-mer coverage, $(wc -c < FastIBS_runs/sample1_v_example_genome.txt) bytes"
+    echo; echo "\$ KDBIntersect kmc_sets/sample1 kmc_sets/sample2"
+    local n; n=$(KDBIntersect kmc_sets/sample1 kmc_sets/sample2 2> FastIBS_runs/intersect.log) || { echo "  failed; see $E/FastIBS_runs/intersect.log"; return 1; }
+    echo "$n"
+    echo "  -> k-mers the two samples share ($(path_of FastIBS_runs/intersect.log | tr a-z A-Z) path)"
+    echo
+    echo "Your own data: one KMC database per sample, counted from its reads, e.g."
+    echo "  ls reads/S1_*.fastq.gz > S1.reads     (paths inside the mounted folder)"
+    echo "  mkdir -p kmc_sets/S1 tmp && kmc -k25 -ci2 -cs255 -t16 -m32 @S1.reads kmc_sets/S1/S1 tmp"
+    echo "then: fastibs kmc_sets/S1 reference FastIBS_runs 50000"
+}
+
+case "${1:-help}" in
+    help|-h|--help) usage ;;
+    info|--version|version) cmd_info ;;
+    selftest) shift; cmd_selftest "$@" ;;
+    example) shift; cmd_example "$@" ;;
+    fit|preflight) shift; exec bash "$SCRIPTS/03_preflight.sh" "$@" ;;
+    fastibs|fastibsmapper|KDBIntersect|probe_bench|kmc|kmc_tools|kmc_dump) exec "$@" ;;
+    *) echo "gpu-ibs: unknown command '$1'" >&2; echo >&2; usage >&2; exit 2 ;;
+esac

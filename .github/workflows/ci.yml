@@ -1,0 +1,40 @@
+# CPU build and the host test suite on every push and pull request
+# (the GPU path is covered by the on-GPU gates under scripts/, which need
+# GPU nodes; GitHub's runners have none).
+name: ci
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the build tools, KMC and GNU awk
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+              cmake ninja-build g++ zlib1g-dev libboost-dev gawk curl ca-certificates
+          # KMC 3.2.4, the official static release (the version the image ships)
+          curl -fsSL -o /tmp/kmc.tar.gz \
+              https://github.com/refresh-bio/KMC/releases/download/v3.2.4/KMC3.2.4.linux.x64.tar.gz
+          echo "158f2084f8d928b3f33b8aaf7d1220fee4183bf46837787e5e6b16bbdf54d31d  /tmp/kmc.tar.gz" | sha256sum -c -
+          mkdir -p /tmp/kmc && tar -xzf /tmp/kmc.tar.gz -C /tmp/kmc
+          sudo cp /tmp/kmc/bin/kmc /tmp/kmc/bin/kmc_tools /tmp/kmc/bin/kmc_dump /usr/local/bin/
+      - name: Build (CPU-only)
+        run: FASTIBS_CUDA=off bash compile.sh
+      - name: Tests
+        run: bash scripts/run_tests.sh test_work
+      - name: Logs of a failed run
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-logs
+          path: test_work/logs

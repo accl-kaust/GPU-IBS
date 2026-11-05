@@ -1,0 +1,20 @@
+# The image is built from src/, KMC/, tests/, a few scripts, docker/ and
+# LICENSE; keep everything else (docs, data, builds) out of the
+# build context.
+# hidden files and folders (.git, .github, editor and tool settings)
+.*
+docs
+init
+build
+build-*
+bin
+data
+results
+test_work
+corpus*
+*.sif
+*.tar
+*.docx
+*.pdf
+job_*.sh
+log.txt
