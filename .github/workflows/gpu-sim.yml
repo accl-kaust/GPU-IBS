@@ -1,0 +1,181 @@
+name: GPU Simulator
+
+# Optional, non-required check. ci.yml builds CPU-only because the hosted
+# runners have no GPU, so the GPU path is only covered by the on-GPU gates under
+# scripts/. This builds with CUDA and runs scripts/run_tests.sh and the
+# comparisons of those gates on a simulated NVIDIA H100
+# (https://github.com/pantheongpu/pantheonsim), on the small test corpus.
+#
+# Not run here, because a simulator cannot answer them:
+#   - probe_bench and every timing or throughput figure of the gates (the
+#     simulator has no timing model)
+#   - query routing over peer-to-peer access between two devices (the simulator
+#     does not let a kernel read another device's memory; the two-device cases
+#     below use --no-peer, the host-staged route)
+#   - the 2 Gbp corpus, the real barley sample, the container image gate and the
+#     Ibex release gate
+# It complements the gates on real GPU nodes and does not replace them.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [ main ]
+    paths:
+      - "src/**"
+      - "KMC/**"
+      - "tests/**"
+      - "scripts/run_tests.sh"
+      - "scripts/gate_multidb.sh"
+      - "scripts/make_test_corpus.sh"
+      - "scripts/make_test_panel.sh"
+      - ".github/workflows/gpu-sim.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  gpu-path:
+    name: GPU path (CUDA 13.0 and simulated H100)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          persist-credentials: false
+
+      # Same tools and the same pinned KMC release as ci.yml.
+      - name: Install the build tools, KMC and GNU awk
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+              cmake ninja-build g++ zlib1g-dev libboost-dev gawk curl ca-certificates
+          curl -fsSL -o /tmp/kmc.tar.gz \
+              https://github.com/refresh-bio/KMC/releases/download/v3.2.4/KMC3.2.4.linux.x64.tar.gz
+          echo "158f2084f8d928b3f33b8aaf7d1220fee4183bf46837787e5e6b16bbdf54d31d  /tmp/kmc.tar.gz" | sha256sum -c -
+          mkdir -p /tmp/kmc && tar -xzf /tmp/kmc.tar.gz -C /tmp/kmc
+          sudo cp /tmp/kmc/bin/kmc /tmp/kmc/bin/kmc_tools /tmp/kmc/bin/kmc_dump /usr/local/bin/
+
+      - name: Set up the simulated GPU and CUDA toolkit
+        uses: pantheongpu/setup-pantheonsim@ca87fe3143b29166822b923d6050945c5179408c # v0.1.5
+        with:
+          gpu: nvidia/h100
+          cuda-toolkit: "13.0"
+
+      # CMake is called directly because compile.sh has no switch for the CUDA
+      # runtime library. 90-virtual embeds PTX only, which the simulator runs,
+      # and the simulator needs a shared CUDA runtime.
+      - name: Build (CUDA)
+        run: |
+          cmake -S src -B build -G Ninja \
+            -DFASTIBS_CUDA=ON \
+            -DCMAKE_CUDA_ARCHITECTURES=90-virtual \
+            -DCMAKE_CUDA_RUNTIME_LIBRARY=Shared
+          cmake --build build -j3
+
+      # The whole suite, with the tools taking the GPU path. --quiet keeps the
+      # simulator's start-up line out of the --version output the suite
+      # compares. KEEP=1 keeps the panel logs for the check below.
+      - name: Test suite on the simulated H100
+        run: |
+          set -o pipefail
+          BIN_DIR=build KEEP=1 vgpu run --quiet bash scripts/run_tests.sh test_work | tee suite.log
+
+      # run_tests.sh drops its GPU checks without failing when the trial run
+      # does not reach the device, and the tools fall back to the CPU (same
+      # output) on a device error. Here either one is a failure. The two k=35
+      # checks are not counted as device runs: k > 32 takes the original string
+      # path with --gpu too.
+      - name: Require the GPU checks of the suite
+        run: |
+          n=$(grep -c -E '^  PASS  .*(GPU path == CPU path|on the GPU = |panel mode --gpu: 48 TSV comparisons)' suite.log || true)
+          echo "$n of 11 GPU checks passed"
+          [ "$n" = 11 ]
+          O=test_work/out
+          ls $O/*/gpu.log $O/int_*_gpu.log $O/panel--gpu/*/log > /dev/null
+          if grep -l 'no CUDA device\|falling back' $O/*/gpu.log $O/int_*_gpu.log $O/panel--gpu/*/log; then
+            echo "these runs left the GPU path"; exit 1
+          fi
+          [ "$(grep -l '(GPU-BS)' $O/*_k25/gpu.log $O/*_k31/gpu.log | wc -l)" = 4 ]
+          [ "$(grep -l '^\[gpu\] intersect:' $O/int_*_gpu.log | wc -l)" = 4 ]
+          if grep -h '^K-mer path' $O/panel--gpu/*/log | grep -v '(GPU-BS)'; then
+            echo "a panel run did not take the GPU path"; exit 1
+          fi
+          # gate_multidb.sh compares a panel run with single runs of the same
+          # mode; this compares the GPU files with the CPU files as well
+          diff -r -x log -x '*.log' -x skip.stamp $O/panel--cpu $O/panel--gpu
+
+      # The comparisons of scripts/slurm_phase2.sbatch, slurm_phase3.sbatch,
+      # slurm_phase4.sbatch and slurm_multidb_gate.sbatch, on the k=25 test
+      # corpus: each case must take the path it names and give the output of
+      # the CPU path, byte for byte. The two-device cases run on two simulated
+      # H100s with --no-peer.
+      - name: Probe configurations and two devices
+        run: |
+          W=$PWD/test_work; O=$W/gates; rm -rf "$O"; mkdir -p "$O"
+          passed=0; failed=0
+          pass () { passed=$((passed+1)); echo "  PASS  $*"; }
+          fail () { failed=$((failed+1)); echo "  FAIL  $*"; }
+          gate () { # name, devices, text the log must have, tool, options
+            local name=$1 count=$2 want=$3 tool=$4; shift 4
+            local args=(); [ "$tool" = fastibs ] && args=(50000)
+            local ref=$W/out/${tool}_k25/cpu out=$O/$name
+            mkdir -p "$out"
+            if ! vgpu run --count "$count" "build/$tool" "$W/k25/db" "$W/k25/refs" "$out" "${args[@]}" --gpu "$@" > "$out.log" 2>&1; then
+              fail "$name: exit status"; tail -5 "$out.log"
+            elif ! grep -qF "$want" "$out.log" || grep -q 'no CUDA device\|falling back' "$out.log"; then
+              fail "$name: did not run as '$want'"
+            elif ! diff -r "$ref" "$out" > /dev/null; then
+              fail "$name: output differs from the CPU path"
+            else
+              pass "$name == CPU path  [$want]"
+            fi
+          }
+          gate sync            1 "(GPU-BS sync)"                  fastibs --gpus=1 --sync
+          gate pinned-lut      1 "(GPU-BS)"                       fastibs --gpus=1 --pin-lut
+          gate sorted          1 "(GPU-BS-SORTED)"                fastibs --gpus=1 --sort-queries
+          gate hash            1 "(GPU-HASH)"                     fastibs --gpus=1 --probe=hash
+          gate hash-sorted     1 "(GPU-HASH-SORTED)"              fastibs --gpus=1 --probe=hash --sort-queries
+          gate split           2 "index split across 2 devices"   fastibs --gpus=2 --no-peer
+          gate mapper-split    2 "index split across 2 devices"   fastibsmapper --gpus=2 --no-peer
+
+          want=$(FASTIBS_GPU=0 vgpu run build/KDBIntersect "$W/panel/db1" "$W/panel/db2" 2> /dev/null) || true
+          got=$(vgpu run --count 2 build/KDBIntersect "$W/panel/db1" "$W/panel/db2" 2> "$O/intersect.log") || true
+          if [ -n "$want" ] && [ "$got" = "$want" ] && grep -q 'splitting the index across 2' "$O/intersect.log" \
+              && ! grep -q 'falling back' "$O/intersect.log"; then
+            pass "KDBIntersect on two devices = $got"
+          else
+            fail "KDBIntersect on two devices: $got (CPU: $want)"
+          fi
+
+          rc=0
+          KEEP=1 WORK=$O/panel vgpu run --count 2 bash scripts/gate_multidb.sh build/fastibs "$W/panel" \
+              --gpu --gpus=2 --no-peer > "$O/panel.log" 2>&1 || rc=$?
+          if [ $rc = 0 ] && grep -q '48 TSV comparisons identical' "$O/panel.log" \
+              && ! grep -q 'no CUDA device\|falling back' "$O"/panel/*/log \
+              && ! grep -h '^K-mer path' "$O"/panel/*/log | grep -q -v '(GPU-BS)' \
+              && diff -r -x log -x '*.log' -x skip.stamp "$W/out/panel--cpu" "$O/panel" > /dev/null; then
+            pass "panel mode on two devices: 48 TSV comparisons identical, and == CPU path"
+          else
+            fail "panel mode on two devices (exit $rc)"; tail -5 "$O/panel.log"
+          fi
+
+          echo "$passed passed, $failed failed"
+          [ "$failed" = 0 ] && [ "$passed" = 9 ]
+
+      - name: Logs of a failed run
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gpu-sim-logs
+          path: |
+            suite.log
+            test_work/logs
+            test_work/out/**/*.log
+            test_work/out/**/log
+            test_work/gates/**/*.log
+            test_work/gates/**/log
